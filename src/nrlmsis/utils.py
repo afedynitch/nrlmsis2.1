@@ -6,6 +6,105 @@ import numpy as np
 from .constants import PI
 
 
+def alt2gph_vec(lat: float, alt: np.ndarray) -> np.ndarray:
+    """Vectorized geodetic altitude to geopotential height conversion.
+
+    Args:
+        lat: Geodetic latitude (degrees), scalar.
+        alt: Geodetic altitude (km), array.
+
+    Returns:
+        Geopotential height (km), same shape as alt.
+    """
+    deg2rad = 0.017453292519943295
+
+    # WGS84 Defining parameters
+    a = 6378.1370e3
+    finv = 298.257223563
+    w = 7292115e-11
+    GM = 398600.4418e9
+
+    # Derived parameters (all scalar — lat is fixed)
+    asq = a * a
+    wsq = w * w
+    f = 1.0 / finv
+    esq = 2 * f - f * f
+    e = math.sqrt(esq)
+    Elin = a * e
+    Elinsq = Elin * Elin
+    epr = e / (1 - f)
+    q0 = ((1.0 + 3.0 / (epr * epr)) * math.atan(epr) - 3.0 / epr) / 2.0
+    U0 = -GM * math.atan(epr) / Elin - wsq * asq / 3.0
+    g0 = 9.80665
+    GMdivElin = GM / Elin
+
+    x0sq = 2e7**2
+    Hsq = 1.2e7**2
+
+    sinsqlat = math.sin(lat * deg2rad)**2
+    v = a / math.sqrt(1 - esq * sinsqlat)
+
+    # Altitude-dependent quantities (vectorized)
+    altm = np.asarray(alt, dtype=float) * 1000.0
+    xsq = (v + altm)**2 * (1 - sinsqlat)
+    zsq = (v * (1 - esq) + altm)**2 * sinsqlat
+    rsqminElinsq = xsq + zsq - Elinsq
+    usq = rsqminElinsq / 2.0 + np.sqrt(rsqminElinsq**2 / 4.0 + Elinsq * zsq)
+    cossqdelta = zsq / usq
+
+    epru = Elin / np.sqrt(usq)
+    atanepru = np.arctan(epru)
+    q = ((1 + 3.0 / (epru * epru)) * atanepru - 3.0 / epru) / 2.0
+    U = -GMdivElin * atanepru - wsq * (asq * q * (cossqdelta - 1 / 3.0) / q0) / 2.0
+
+    # Centrifugal potential with taper (vectorized branch)
+    Vc = np.where(xsq <= x0sq,
+                  (wsq / 2.0) * xsq,
+                  (wsq / 2.0) * (Hsq * np.tanh((xsq - x0sq) / Hsq) + x0sq))
+    U = U - Vc
+
+    return (U - U0) / g0 / 1000.0
+
+
+def dilog_vec(x0: np.ndarray) -> np.ndarray:
+    """Vectorized dilogarithm Li₂(x) for domain [0, 1).
+
+    Args:
+        x0: Input values in [0, 1), array.
+
+    Returns:
+        Dilogarithm values, same shape as x0.
+    """
+    pi2_6 = PI * PI / 6.0
+    x0 = np.asarray(x0, dtype=float)
+    mask_hi = x0 > 0.5
+
+    # High branch (x > 0.5): transform xlo = 1 - x
+    # Guard against log domain errors by clamping
+    safe_x0 = np.where(mask_hi, x0, 1.0)            # for log(x0)
+    safe_xlo = np.where(mask_hi, 1.0 - x0, 0.5)     # 1-x0 for hi; dummy for lo
+    hi_lnx = np.log(safe_x0)
+    hi_lnxlo = np.log(np.maximum(safe_xlo, 1e-300))
+    hi_xx = safe_xlo * safe_xlo
+    hi_x4 = 4.0 * safe_xlo
+    hi_val = (pi2_6 - hi_lnx * hi_lnxlo -
+              (4.0 * hi_xx * (23.0 / 16.0 + safe_xlo / 36.0
+                              + hi_xx / 576.0 + hi_xx * safe_xlo / 3600.0)
+               + hi_x4 + 3.0 * (1.0 - hi_xx) * hi_lnx) / (1.0 + hi_x4 + hi_xx))
+
+    # Low branch (x <= 0.5): use x directly
+    safe_x_lo = np.where(~mask_hi, x0, 0.0)          # for lo branch
+    lo_1mx = np.where(~mask_hi, 1.0 - x0, 1.0)       # guard log(1-x)
+    lo_xx = safe_x_lo * safe_x_lo
+    lo_x4 = 4.0 * safe_x_lo
+    lo_val = ((4.0 * lo_xx * (23.0 / 16.0 + safe_x_lo / 36.0
+                               + lo_xx / 576.0 + lo_xx * safe_x_lo / 3600.0)
+               + lo_x4 + 3.0 * (1.0 - lo_xx) * np.log(lo_1mx))
+              / (1.0 + lo_x4 + lo_xx))
+
+    return np.where(mask_hi, hi_val, lo_val)
+
+
 def alt2gph(lat: float, alt: float) -> float:
     """Convert geodetic altitude to geopotential height.
 

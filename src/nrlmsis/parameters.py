@@ -54,6 +54,13 @@ class ModelParameters:
     eta_o1: np.ndarray = field(default_factory=lambda: np.zeros((31, 5)))
     eta_no: np.ndarray = field(default_factory=lambda: np.zeros((31, 5)))
 
+    # OPT-2: Precomputed TN basis matrix (ITB0 x (MBF+1)) for fast matmul
+    TN_beta_lin_T: np.ndarray = field(default_factory=lambda: np.empty((0, 0)))
+
+    # OPT-3: Precomputed B-spline weights for constant-zetaM species.
+    # Dict[ispec, List of 5 entries]: each entry is (si_col, iz, delz) if zetaMi < ZETA_B, else None.
+    wmz_precomputed: dict = field(default_factory=dict)
+
     # C1 constraint terms for O and NO
     hr_fact_o1_ref: float = 0.0
     dhr_fact_o1_ref: float = 0.0
@@ -352,5 +359,33 @@ def load_model(parm_file: str | Path | None = None,
 
     # N2 flag
     params.n2r_flag = n2_msis00
+
+    # OPT-2: Precompute transposed TN basis matrix for fast matmul in compute_temperature()
+    params.TN_beta_lin_T = np.ascontiguousarray(params.TN.beta[:C.MBF + 1, :C.ITB0].T)
+
+    # OPT-3: Precompute B-spline weights for constant-zetaM species (O2=3, O=4, He=5, H=6, Ar=7, N=8)
+    from .utils import bspline as _bspline
+    _spec_psets = {
+        3: params.O2,
+        4: params.O1,
+        5: params.HE,
+        6: params.H1,
+        7: params.AR,
+        8: params.N1,
+    }
+    for _ispec, _pset in _spec_psets.items():
+        _zetaM = float(_pset.beta[0, 1])
+        _HML = float(_pset.beta[0, 2])
+        _HMU = float(_pset.beta[0, 3])
+        _zetaMi = [_zetaM - 2*_HML, _zetaM - _HML, _zetaM, _zetaM + _HMU, _zetaM + 2*_HMU]
+        _entries = []
+        for _i in range(5):
+            _delz = _zetaMi[_i] - C.ZETA_B
+            if _zetaMi[_i] < C.ZETA_B:
+                _Si, _iz = _bspline(_zetaMi[_i], C.NODES_TN, C.ND + 2, 6, params.eta_tn)
+                _entries.append((_Si[:6, 4].copy(), _iz, _delz))
+            else:
+                _entries.append(None)
+        params.wmz_precomputed[_ispec] = _entries
 
     return params

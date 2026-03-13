@@ -1,2 +1,5 @@
 *.egg-info
 *.pyc
+f90original/*.mod
+*.exe
+msis2.1_test_out.txt

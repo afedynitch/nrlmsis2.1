@@ -291,15 +291,11 @@ def sfluxmod(iz: int, gf: np.ndarray, parmset: BasisSubset,
     else:
         f3 = 0.0
 
-    total = 0.0
-    for j in range(C.MBF + 1):
-        if zsfx[j]:
-            total += parmset.beta[j, iz] * gf[j] * f1
-        elif tsfx[j]:
-            total += parmset.beta[j, iz] * gf[j] * f2
-        elif psfx[j]:
-            total += parmset.beta[j, iz] * gf[j] * f3
-
+    beta_col = parmset.beta[:C.MBF + 1, iz]
+    gf_lin = gf[:C.MBF + 1]
+    total = (np.dot(beta_col[zsfx], gf_lin[zsfx]) * f1
+             + np.dot(beta_col[tsfx], gf_lin[tsfx]) * f2
+             + np.dot(beta_col[psfx], gf_lin[psfx]) * f3)
     return total
 
 

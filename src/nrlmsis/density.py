@@ -251,16 +251,27 @@ def compute_density(ispec: int, gf: np.ndarray, tpro: TnParm,
     for i in range(4):
         dpro.aMi[i] = (dpro.Mi[i + 1] - dpro.Mi[i]) / (dpro.zetaMi[i + 1] - dpro.zetaMi[i])
 
-    for i in range(5):
-        delz = dpro.zetaMi[i] - C.ZETA_B
-        if dpro.zetaMi[i] < C.ZETA_B:
-            Si, iz = bspline(dpro.zetaMi[i], C.NODES_TN, C.ND + 2, 6, params.eta_tn)
-            # Si[offset+5, k-2]: k=6 → col 4, offsets iz-5:iz → rows (iz-5+5):(iz+5+1) = 0:6
-            dpro.WMi[i] = np.dot(tpro.gamma[iz - 5:iz + 1], Si[:6, 4]) + tpro.cVs * delz + tpro.cWs
-        else:
-            dpro.WMi[i] = ((0.5 * delz * delz
-                            + dilog(tpro.b * math.exp(-tpro.sigma * delz)) / tpro.sigmasq) / tpro.tex
-                           + tpro.cVb * delz + tpro.cWb)
+    if ispec in params.wmz_precomputed:
+        # OPT-3: use precomputed B-spline weights for constant-zetaM species
+        for i, entry in enumerate(params.wmz_precomputed[ispec]):
+            if entry is None:
+                delz = dpro.zetaMi[i] - C.ZETA_B
+                dpro.WMi[i] = ((0.5 * delz * delz
+                                + dilog(tpro.b * math.exp(-tpro.sigma * delz)) / tpro.sigmasq) / tpro.tex
+                               + tpro.cVb * delz + tpro.cWb)
+            else:
+                si_col, _iz, delz = entry
+                dpro.WMi[i] = np.dot(tpro.gamma[_iz - 5:_iz + 1], si_col) + tpro.cVs * delz + tpro.cWs
+    else:
+        for i in range(5):
+            delz = dpro.zetaMi[i] - C.ZETA_B
+            if dpro.zetaMi[i] < C.ZETA_B:
+                Si, iz = bspline(dpro.zetaMi[i], C.NODES_TN, C.ND + 2, 6, params.eta_tn)
+                dpro.WMi[i] = np.dot(tpro.gamma[iz - 5:iz + 1], Si[:6, 4]) + tpro.cVs * delz + tpro.cWs
+            else:
+                dpro.WMi[i] = ((0.5 * delz * delz
+                                + dilog(tpro.b * math.exp(-tpro.sigma * delz)) / tpro.sigmasq) / tpro.tex
+                               + tpro.cVb * delz + tpro.cWb)
 
     dpro.XMi[0] = -dpro.aMi[0] * dpro.WMi[0]
     for i in range(1, 4):
@@ -400,3 +411,26 @@ def _pwmp(z: float, zm: np.ndarray, m: np.ndarray, dmdz: np.ndarray) -> float:
         if z < zm[inode + 1]:
             return m[inode] + dmdz[inode] * (z - zm[inode])
     raise RuntimeError('Error in _pwmp')
+
+
+def _pwmp_vec(z_arr: np.ndarray, zm: np.ndarray, m: np.ndarray,
+              dmdz: np.ndarray) -> np.ndarray:
+    """Vectorized piecewise effective mass profile interpolation.
+
+    Args:
+        z_arr: Geopotential heights (km), array of shape (N,).
+        zm: Five breakpoint altitudes, shape (5,).
+        m: Five mass values at breakpoints, shape (5,).
+        dmdz: Four mass gradients per segment, shape (4,).
+
+    Returns:
+        Effective mass at each altitude, shape (N,).
+    """
+    result = np.where(z_arr >= zm[4], m[4], m[0])
+    mid = (z_arr > zm[0]) & (z_arr < zm[4])
+    if mid.any():
+        z_m = z_arr[mid]
+        seg = np.searchsorted(zm[1:5], z_m, side='left')   # 0-3
+        result = result.copy()
+        result[mid] = m[seg] + dmdz[seg] * (z_m - zm[seg])
+    return result

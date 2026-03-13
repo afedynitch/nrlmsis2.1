@@ -45,9 +45,8 @@ def compute_temperature(gf: np.ndarray, params: ModelParameters) -> TnParm:
     TN = params.TN
     mbf = C.MBF
 
-    # Unconstrained spline coefficients
-    for ix in range(C.ITB0):
-        tpro.cf[ix] = np.dot(TN.beta[:mbf + 1, ix], gf[:mbf + 1])
+    # Unconstrained spline coefficients (single BLAS matmul instead of 22 dot calls)
+    tpro.cf[:C.ITB0] = params.TN_beta_lin_T @ gf[:mbf + 1]
 
     for ix in range(C.ITB0):
         if params.smod[ix]:
