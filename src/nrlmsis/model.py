@@ -15,7 +15,7 @@ from .parameters import ModelParameters, load_model
 from .globe import GlobeFunction
 from .temperature import TnParm, compute_temperature, eval_temperature
 from .density import DnParm, compute_density, eval_density, _pwmp_vec
-from .utils import alt2gph, alt2gph_vec, bspline, dilog, dilog_vec
+from .utils import alt2gph, alt2gph_vec, bspline, bspline_vec, dilog, dilog_vec
 
 
 @dataclass(frozen=True)
@@ -283,12 +283,12 @@ class NRLMSIS21:
             tn_arr[above_mask] = tn_ab
             dn_arr[:, above_mask] = dn_ab
 
-        # Scalar fallback for altitudes < ZETA_B
-        for idx in np.where(below_mask)[0]:
-            result = self.calc(day, utsec, float(z_arr[idx]), lat, lon,
-                               sfluxavg, sflux, ap)
-            tn_arr[idx] = result.temperature
-            dn_arr[:, idx] = result.densities
+        # Vectorized path for altitudes < ZETA_B
+        if below_mask.any():
+            zeta_bb = zeta_arr[below_mask]
+            tn_bb, dn_bb = self._eval_below_zetaB(zeta_bb, tpro, pcache, params)
+            tn_arr[below_mask] = tn_bb
+            dn_arr[:, below_mask] = dn_bb
 
         return MSISOutputArray(
             temperature=tn_arr,
@@ -358,6 +358,173 @@ class NRLMSIS21:
 
             dn_arr[ispec - 1] = (np.exp(dpro.lndref - Ihyd_arr * C.G0DIVKB + ccor)
                                  * dpro.Tref / tn_arr)
+
+        if params.spec_flag[0]:
+            dn_arr[0] = params.mass_wgt @ dn_arr
+
+        return tn_arr, dn_arr
+
+    def _eval_below_zetaB(self, zeta_arr: np.ndarray, tpro: TnParm,
+                          pcache: ProfileCache,
+                          params: ModelParameters) -> tuple[np.ndarray, np.ndarray]:
+        """Vectorized density/temperature evaluation for zeta < ZETA_B.
+
+        Mirrors :meth:`_eval_above_zetaB` for the B-spline temperature regime.
+        Numerically equivalent to looping :meth:`calc` over zeta but ~100×
+        faster on N=2000 altitudes.
+
+        Returns (tn_arr shape (N,), dn_arr shape (10, N)).
+        """
+        N = zeta_arr.shape[0]
+
+        # ---- B-spline basis evaluation for temperature profile (always k≤6) ----
+        sz_arr, iz_arr = bspline_vec(zeta_arr, C.NODES_TN, C.ND + 2, 6, params.eta_tn)
+
+        # ---- Temperature: tn = 1 / Σ cf[iz-3+j] * sz[2+j, 2], j=0..3 ----
+        # Clamped indices avoid OOB reads; the corresponding sz weights are zero
+        # at boundary cases (verified bit-exact vs scalar in test_bspline_vec.py).
+        j_temp = np.arange(4)
+        cf = tpro.cf
+        idx_temp = np.clip(iz_arr[:, None] - 3 + j_temp[None, :], 0, cf.shape[0] - 1)
+        cf_gather = cf[idx_temp]                          # (N, 4)
+        wght_temp = sz_arr[:, 2:6, 2]                     # (N, 4)
+        tn_arr = 1.0 / np.einsum('nj,nj->n', cf_gather, wght_temp)
+
+        # ---- Vz and Wz integration terms ----
+        # Below ZETA_F: Vz uses k=5 spline (col 3), Wz = 0, lndtotz from baro eq.
+        # ZETA_F ≤ zeta < ZETA_B: Vz uses k=5 spline, Wz uses k=6 spline (col 4),
+        # lndtotz = 0 (placeholder; mixing-ratio species follow the hydrostatic
+        # integral; the (2,3,5,7)-below-zhyd branch uses lndtotz but those
+        # altitudes always satisfy zeta < ZETA_F, where lndtotz is computed
+        # below — see scalar :func:`eval_density`).
+        delz_arr = zeta_arr - C.ZETA_B
+
+        # Vz: dot(beta[iz-4:iz+1], sz[1:6, 3])  — same formula in both branches
+        j_vz = np.arange(5)
+        beta = tpro.beta
+        idx_vz = np.clip(iz_arr[:, None] - 4 + j_vz[None, :], 0, beta.shape[0] - 1)
+        beta_gather = beta[idx_vz]                        # (N, 5)
+        sz_vz = sz_arr[:, 1:6, 3]                         # (N, 5)
+        Vz_arr = np.einsum('nj,nj->n', beta_gather, sz_vz) + tpro.cVs
+
+        # Wz: dot(gamma[iz-5:iz+1], sz[0:6, 4]) + cVs*delz + cWs   — only used
+        # for zeta ≥ ZETA_F. Below ZETA_F it must be 0 to match scalar exactly.
+        j_wz = np.arange(6)
+        gamma = tpro.gamma
+        idx_wz = np.clip(iz_arr[:, None] - 5 + j_wz[None, :], 0, gamma.shape[0] - 1)
+        gamma_gather = gamma[idx_wz]                      # (N, 6)
+        sz_wz = sz_arr[:, 0:6, 4]                         # (N, 6)
+        Wz_calc = (np.einsum('nj,nj->n', gamma_gather, sz_wz)
+                   + tpro.cVs * delz_arr + tpro.cWs)
+        below_zetaF = zeta_arr < C.ZETA_F
+        Wz_arr = np.where(below_zetaF, 0.0, Wz_calc)
+
+        # lndtotz = LNP0 - MBARG0DIVKB * (Vz - Vzeta0) - log(KB * tn)
+        # Only meaningful where it's actually used (species 2,3,5,7 below zhyd,
+        # which itself happens only below ZETA_F). Above ZETA_F set to 0
+        # to match scalar's placeholder.
+        lnPz_arr = C.LNP0 - C.MBARG0DIVKB * (Vz_arr - tpro.Vzeta0)
+        lndtotz_arr = np.where(below_zetaF,
+                                lnPz_arr - np.log(C.KB * tn_arr),
+                                0.0)
+
+        # ---- Geomagnetic taper ----
+        HRfact_arr = 0.5 * (1.0 + np.tanh(C.H_GAMMA * (zeta_arr - C.ZETA_GAMMA)))
+
+        # ---- Per-species evaluation ----
+        dn_arr = np.full((10, N), C.DMISSING)
+
+        # Pre-compute O1 and NO B-spline bases (used by species 4 and 10 below
+        # their respective zhyd). Cheap relative to the species loop.
+        sz_o1_arr = None
+        iz_o1_arr = None
+        sz_no_arr = None
+        iz_no_arr = None
+        if 4 in pcache.dpro and params.spec_flag[3]:
+            sz_o1_arr, iz_o1_arr = bspline_vec(
+                zeta_arr, C.NODES_O1, C.NDO1, 4, params.eta_o1
+            )
+        if 10 in pcache.dpro and params.spec_flag[9]:
+            no_lndref = pcache.dpro[10].lndref
+            if no_lndref != 0.0:
+                sz_no_arr, iz_no_arr = bspline_vec(
+                    zeta_arr, C.NODES_NO, C.NDNO, 4, params.eta_no
+                )
+
+        for ispec in range(2, C.NSPEC):
+            if not (params.spec_flag[ispec - 1] and ispec in pcache.dpro):
+                continue
+            dpro = pcache.dpro[ispec]
+
+            # zmin guard (scalar returns DMISSING below zmin)
+            valid_mask = zeta_arr >= dpro.zmin
+
+            # --- Anomalous Oxygen (ispec=9): simple exponential ---
+            if ispec == 9:
+                result = (dpro.lndref
+                          - (zeta_arr - dpro.zref) / C.HOA
+                          - dpro.C_coeff * np.exp(-(zeta_arr - dpro.zetaC) / dpro.HC))
+                vals = np.exp(result)
+                dn_arr[ispec - 1] = np.where(valid_mask, vals, C.DMISSING)
+                continue
+
+            # --- NO undefined ---
+            if ispec == 10 and dpro.lndref == 0.0:
+                continue   # remains DMISSING
+
+            # --- Chapman / logistic correction (vectorized) ---
+            tanh_R = np.tanh((zeta_arr - dpro.zetaR) / (HRfact_arr * dpro.HR))
+            if ispec in (2, 3, 5, 7):
+                ccor_arr = dpro.R * (1.0 + tanh_R)
+            else:  # 4, 6, 8, 10
+                ccor_arr = (-dpro.C_coeff * np.exp(-(zeta_arr - dpro.zetaC) / dpro.HC)
+                            + dpro.R * (1.0 + tanh_R))
+
+            below_zhyd = zeta_arr < dpro.zhyd
+            above_zhyd = ~below_zhyd
+
+            # --- Below-zhyd branch (mixing ratio or species spline) ---
+            below_vals = np.full(N, C.DMISSING)
+
+            if ispec in (2, 3, 5, 7):
+                # density = exp(lndtotz + lnPhiF + ccor)
+                below_vals = np.exp(lndtotz_arr + dpro.lnPhiF + ccor_arr)
+            elif ispec == 4 and sz_o1_arr is not None:
+                # density = exp(Σ cf[iz-3+j] * sz_o1[2+j, 2])
+                j4 = np.arange(4)
+                cf_o = dpro.cf
+                idx4 = np.clip(iz_o1_arr[:, None] - 3 + j4[None, :], 0, cf_o.shape[0] - 1)
+                cf4 = cf_o[idx4]
+                w4 = sz_o1_arr[:, 2:6, 2]
+                below_vals = np.exp(np.einsum('nj,nj->n', cf4, w4))
+            elif ispec == 10 and sz_no_arr is not None:
+                j4 = np.arange(4)
+                cf_no = dpro.cf
+                idx4 = np.clip(iz_no_arr[:, None] - 3 + j4[None, :], 0, cf_no.shape[0] - 1)
+                cf4 = cf_no[idx4]
+                w4 = sz_no_arr[:, 2:6, 2]
+                below_vals = np.exp(np.einsum('nj,nj->n', cf4, w4))
+            # ispec 6, 8 — He, Ar: no below-zhyd formula; fall through to
+            # hydrostatic only (below_vals stays DMISSING, but below_zhyd is
+            # never true for them in practice since their zhyd is at zmin).
+
+            # --- Above-zhyd branch (hydrostatic) ---
+            Mz_arr = _pwmp_vec(zeta_arr, dpro.zetaMi, dpro.Mi, dpro.aMi)
+            Ihyd_arr = Mz_arr * Vz_arr - dpro.Izref
+            high4 = zeta_arr >= dpro.zetaMi[4]
+            in_range = (zeta_arr > dpro.zetaMi[0]) & ~high4
+            Ihyd_arr = Ihyd_arr.copy()
+            Ihyd_arr[high4] -= dpro.XMi[4]
+            if in_range.any():
+                z_in = zeta_arr[in_range]
+                seg = np.searchsorted(dpro.zetaMi[1:4], z_in, side='left')
+                Ihyd_arr[in_range] -= dpro.aMi[seg] * Wz_arr[in_range] + dpro.XMi[seg]
+            above_vals = (np.exp(dpro.lndref - Ihyd_arr * C.G0DIVKB + ccor_arr)
+                          * dpro.Tref / tn_arr)
+
+            # --- Combine, applying valid_mask ---
+            combined = np.where(below_zhyd, below_vals, above_vals)
+            dn_arr[ispec - 1] = np.where(valid_mask, combined, C.DMISSING)
 
         if params.spec_flag[0]:
             dn_arr[0] = params.mass_wgt @ dn_arr

@@ -295,6 +295,128 @@ def bspline(x: float, nodes: np.ndarray, nd: int, kmax: int,
     return S, i
 
 
+def bspline_vec(x_arr: np.ndarray, nodes: np.ndarray, nd: int, kmax: int,
+                eta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorized Cox-de Boor B-spline evaluation.
+
+    Computes the same per-point output as :func:`bspline` for each entry of
+    ``x_arr``, in pure numpy with no Python loop over altitudes.
+
+    Args:
+        x_arr: 1D array of evaluation points, shape (N,).
+        nodes: Spline node array (same as scalar bspline).
+        nd: Number of spline nodes minus one.
+        kmax: Maximum spline order (2..6).
+        eta: Precomputed reciprocal node differences, shape (nd, 5).
+
+    Returns:
+        S_arr: shape (N, 6, 5). S_arr[n, offset+5, k-2] is the order-k B-spline
+            weight at offset (-5..0) for point n.
+        iz_arr: shape (N,), int. Knot interval index per point;
+            -1 if x_arr[n] <= nodes[0]; nd if x_arr[n] >= nodes[nd].
+    """
+    x = np.asarray(x_arr, dtype=float).ravel()
+    N = x.shape[0]
+    S = np.zeros((N, 6, 5))
+
+    # Knot interval via searchsorted (side='right' so x in [nodes[i], nodes[i+1])
+    # → returns i+1, giving iz=i after the -1).
+    iz_raw = np.searchsorted(nodes[:nd + 1], x, side='right') - 1
+
+    # Match scalar's early-return behaviour: x <= nodes[0] → iz=-1, x >= nodes[nd] → iz=nd.
+    high = x >= nodes[nd]
+    low = x <= nodes[0]
+    iz = np.where(high, nd, np.where(low, -1, iz_raw)).astype(np.int64)
+
+    inside = ~(high | low)
+    if not inside.any():
+        return S, iz
+
+    in_idx = np.flatnonzero(inside)
+    iz_in = iz[in_idx]
+    x_in = x[in_idx]
+    Ni = iz_in.shape[0]
+
+    # w[:, l+4] holds the weight at offset l (in {-4,...,0}), per-altitude.
+    w = np.zeros((Ni, 5))
+    Sl = np.zeros((Ni, 6, 5))
+
+    def _safe_gather_node(idx):
+        """Read nodes[idx] safely; entries with idx<0 are clamped to 0 and the
+        caller is responsible for masking them with np.where."""
+        return nodes[np.maximum(idx, 0)]
+
+    def _safe_gather_eta(idx, col):
+        return eta[np.maximum(idx, 0), col]
+
+    # ----- k=2 (linear) -----
+    w0 = (x_in - nodes[iz_in]) * eta[iz_in, 0]
+    w[:, 4] = w0
+    Sl[:, 5, 0] = np.where(iz_in < (nd - 1), w0, 0.0)          # S(0, 2)
+    Sl[:, 4, 0] = np.where(iz_in > 0, 1.0 - w0, 0.0)           # S(-1, 2)
+
+    # ----- k=3 (quadratic) -----
+    w[:, 3] = np.where(iz_in > 0,
+                       (x_in - _safe_gather_node(iz_in - 1)) * _safe_gather_eta(iz_in - 1, 1),
+                       0.0)
+    w[:, 4] = (x_in - nodes[iz_in]) * eta[iz_in, 1]
+    Sl[:, 5, 1] = np.where(iz_in < (nd - 2),
+                           w[:, 4] * Sl[:, 5, 0], 0.0)         # S(0, 3)
+    valid = (iz_in > 0) & ((iz_in - 1) < (nd - 2))
+    Sl[:, 4, 1] = np.where(valid,
+                           w[:, 3] * Sl[:, 4, 0] + (1.0 - w[:, 4]) * Sl[:, 5, 0],
+                           0.0)                                # S(-1, 3)
+    Sl[:, 3, 1] = np.where(iz_in > 1,
+                           (1.0 - w[:, 3]) * Sl[:, 4, 0], 0.0) # S(-2, 3)
+
+    if kmax >= 4:
+        # ----- k=4..kmax (generic) -----
+        for k in range(4, kmax + 1):
+            col_w = k - 2          # eta column index
+            col_prev = k - 3       # previous order column in Sl
+            col_new = k - 2        # current order column in Sl
+
+            # w[:, l+4] for offsets l in 0, -1, ..., -(k-2)
+            for l in range(0, -(k - 1), -1):
+                l_idx = l + 4
+                w[:, l_idx] = np.where(iz_in + l >= 0,
+                                       (x_in - _safe_gather_node(iz_in + l)) *
+                                       _safe_gather_eta(iz_in + l, col_w),
+                                       0.0)
+
+            # S(0, k)  = w[:, 4] * S(0, k-1);   valid if iz < nd-(k-1)
+            S_prev_top = Sl[:, 5, col_prev]
+            Sl[:, 5, col_new] = np.where(iz_in < (nd - (k - 1)),
+                                          w[:, 4] * S_prev_top, 0.0)
+
+            # Middle: S(m, k) = w[m+4]*S(m,k-1) + (1 - w[m+5])*S(m+1,k-1)
+            #   for m in -1, ..., -(k-2)
+            for m in range(-1, -(k - 1), -1):
+                row = m + 5
+                valid = (iz_in + m >= 0) & ((iz_in + m) < (nd - (k - 1)))
+                Sl[:, row, col_new] = np.where(
+                    valid,
+                    w[:, m + 4] * Sl[:, row, col_prev]
+                    + (1.0 - w[:, m + 5]) * Sl[:, row + 1, col_prev],
+                    0.0,
+                )
+
+            # S(-(k-1), k) = (1 - w[6-k]) * S(-(k-2), k-1);   valid if iz-(k-1) >= 0
+            m_last = -(k - 1)
+            row_last = m_last + 5                # = 6-k
+            row_prev_bot = m_last + 6            # = 7-k
+            w_idx_for_bot = 6 - k                # = m_last + 5 (clearer this way)
+            Sl[:, row_last, col_new] = np.where(
+                iz_in + m_last >= 0,
+                (1.0 - w[:, w_idx_for_bot]) * Sl[:, row_prev_bot, col_prev],
+                0.0,
+            )
+
+    # Scatter back to full N-array
+    S[in_idx] = Sl
+    return S, iz
+
+
 def dilog(x0: float) -> float:
     """Compute dilogarithm Li₂(x) for domain [0, 1).
 

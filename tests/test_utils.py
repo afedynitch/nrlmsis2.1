@@ -5,7 +5,9 @@ import math
 import numpy as np
 import pytest
 
-from nrlmsis.utils import alt2gph, gph2alt, dilog
+from nrlmsis.utils import alt2gph, bspline, bspline_vec, dilog, gph2alt
+import nrlmsis.constants as _C
+from nrlmsis.parameters import load_model
 
 
 class TestAlt2Gph:
@@ -68,3 +70,56 @@ class TestDilog:
         x = 0.999
         result = dilog(x)
         assert result == pytest.approx(math.pi**2 / 6.0, rel=0.01)
+
+
+class TestBsplineVec:
+    """Vectorized B-spline (bspline_vec) must match scalar bspline for any kmax."""
+
+    @pytest.fixture(scope='class')
+    def fixtures(self):
+        params = load_model()
+        return _C.NODES_TN, _C.ND + 2, params.eta_tn
+
+    @pytest.mark.parametrize('kmax', [2, 3, 4, 5, 6])
+    def test_matches_scalar_on_sweep(self, fixtures, kmax):
+        nodes, nd, eta = fixtures
+        x_sweep = np.concatenate([
+            np.array([-20.0, nodes[0], nodes[0] + 1e-9]),
+            np.linspace(nodes[0] + 0.1, nodes[nd] - 0.1, 200),
+            nodes[3:8].copy(),
+            nodes[15:22].copy(),
+            np.array([nodes[nd] - 1e-9, nodes[nd], nodes[nd] + 5.0]),
+        ])
+
+        S_vec, iz_vec = bspline_vec(x_sweep, nodes, nd, kmax, eta)
+
+        S_ref = np.zeros_like(S_vec)
+        iz_ref = np.zeros_like(iz_vec)
+        for n, x in enumerate(x_sweep):
+            s, i = bspline(float(x), nodes, nd, kmax, eta)
+            S_ref[n] = s
+            iz_ref[n] = i
+
+        # The scalar bspline writes to columns kmax-2 .. 4 regardless of kmax
+        # (kmax only short-circuits between k=5 and k=6). Only cols [0, kmax-2]
+        # are meaningfully populated by either path; callers only read those.
+        cols = kmax - 1
+        np.testing.assert_array_equal(iz_vec, iz_ref)
+        np.testing.assert_array_equal(S_vec[:, :, :cols], S_ref[:, :, :cols])
+
+    def test_out_of_bounds_returns_zero(self, fixtures):
+        nodes, nd, eta = fixtures
+        x = np.array([-100.0, nodes[0] - 1e-3, nodes[nd], nodes[nd] + 50.0])
+        S_vec, iz_vec = bspline_vec(x, nodes, nd, 6, eta)
+        # All-zero S for OOB; iz = -1 (low) or nd (high)
+        np.testing.assert_array_equal(S_vec, 0.0)
+        assert iz_vec[0] == -1
+        assert iz_vec[1] == -1
+        assert iz_vec[2] == nd
+        assert iz_vec[3] == nd
+
+    def test_empty_input(self, fixtures):
+        nodes, nd, eta = fixtures
+        S_vec, iz_vec = bspline_vec(np.array([]), nodes, nd, 6, eta)
+        assert S_vec.shape == (0, 6, 5)
+        assert iz_vec.shape == (0,)
